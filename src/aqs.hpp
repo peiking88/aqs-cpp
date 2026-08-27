@@ -24,7 +24,7 @@
 
 namespace aqs {
 
-inline constexpr std::string_view version = "0.1.0";
+inline constexpr std::string_view version = "0.1.1";
 
 // IllegalMonitorStateException 的对应物：未持有同步状态却调用释放/通知类接口
 class monitor_error : public std::logic_error {
@@ -48,6 +48,13 @@ class abstract_aqs {
   void acquire_shared(int arg);
   bool acquire_shared_for(int arg, std::chrono::nanoseconds timeout);
   bool release_shared(int arg);
+
+  // ---- 白盒可观测性 ----
+  // 本同步器生命周期内经队列真正投递的内核唤醒次数。用于区分“干净的传播
+  // 唤醒”与 2ms 有界睡的轮询兜底——后者会掩盖丢唤醒缺陷（design §5）。
+  unsigned long stats_wakeups() const noexcept {
+    return stats_wakeups_.load(std::memory_order_relaxed);
+  }
 
  protected:
   // 未覆写的钩子被调用时抛出（对应 Java 的 UnsupportedOperationException）
@@ -177,6 +184,8 @@ class abstract_aqs {
   std::atomic<node*> tail_{nullptr};
   // ---- 独占持有者（exclusiveOwnerThread）----
   std::thread::id exclusive_owner_{};
+  // ---- 白盒唤醒计数（relaxed 即可，仅测试用于活性证据）----
+  std::atomic<unsigned long> stats_wakeups_{0};
   // ---- 节点仓库：Java 由 GC 回收节点，这里延迟到析构统一回收。----
   // ponytail: arena 替代 GC；活跃队列中的节点可能仍被其他线程的 prev 扫描引用，
   // 逐个 delete 有悬垂风险，摊销成本是每节点一次互斥保护的堆分配。
@@ -227,6 +236,8 @@ class semaphore : private abstract_aqs {
   void release();                               // 归还一个许可
   int  available_permits() const noexcept { return get_state(); }
 
+  using abstract_aqs::stats_wakeups;            // 白盒唤醒计数透出（测试用）
+
  private:
   int  try_acquire_shared(int arg) override;    // 返回剩余许可数，负值表示不足
   bool try_release_shared(int arg) override;
@@ -245,6 +256,8 @@ class countdown_latch : private abstract_aqs {
   bool await_for(std::chrono::nanoseconds timeout);
   void count_down();                            // 计数减一，减到 0 唤醒所有等待者
   long count() const noexcept { return get_state(); }
+
+  using abstract_aqs::stats_wakeups;            // 白盒唤醒计数透出（测试用）
 
  private:
   int  try_acquire_shared(int arg) override;    // state==0 才放行

@@ -271,6 +271,8 @@ void abstract_aqs::acquire_queued(node* n, int arg) {
 }
 
 void abstract_aqs::acquire(int arg) {
+  if (try_acquire(arg))          // 无竞争快速路径（Java acquire 先试钩子后才 addWaiter）
+    return;
   acquire_queued(add_waiter(mode::exclusive), arg);
 }
 
@@ -303,6 +305,8 @@ bool abstract_aqs::do_acquire_nanos(node* n, int arg,
 
 bool abstract_aqs::acquire_for(int arg, std::chrono::nanoseconds timeout) {
   if (timeout <= std::chrono::nanoseconds::zero()) return false;
+  if (try_acquire(arg))          // 快速路径：未超时约束下的立即尝试
+    return true;
   return do_acquire_nanos(add_waiter(mode::exclusive), arg,
                           steady_clock::now() + timeout);
 }
@@ -359,7 +363,10 @@ void abstract_aqs::unpark_successor(node* n) noexcept {
          t != nullptr && t != n; t = t->prev_.load(std::memory_order_acquire))
       if (t->wait_status_.load(std::memory_order_acquire) <= 0) s = t;
   }
-  if (s != nullptr) s->unpark();
+  if (s != nullptr) {
+    stats_wakeups_.fetch_add(1, std::memory_order_relaxed);
+    s->unpark();
+  }
 }
 
 // ================= 共享模式获取/释放流程 =================
@@ -417,11 +424,15 @@ bool abstract_aqs::do_acquire_shared_nanos(node* n, int arg,
 }
 
 void abstract_aqs::acquire_shared(int arg) {
+  if (try_acquire_shared(arg) >= 0)   // 快速路径：队列本为空，无需传播
+    return;
   do_acquire_shared(add_waiter(mode::shared), arg);
 }
 
 bool abstract_aqs::acquire_shared_for(int arg, std::chrono::nanoseconds timeout) {
   if (timeout <= std::chrono::nanoseconds::zero()) return false;
+  if (try_acquire_shared(arg) >= 0)
+    return true;                      // 同上：非队列成员的成功不欠任何传播
   return do_acquire_shared_nanos(add_waiter(mode::shared), arg,
                                  steady_clock::now() + timeout);
 }
@@ -488,8 +499,10 @@ bool abstract_aqs::transfer_for_signal(node* n) {
     return false;                // 已被超时取消等场景处理过
   node* p = enq(n);
   int ws = p->wait_status_.load(std::memory_order_acquire);
-  if (ws > 0 || !p->wait_status_.compare_exchange_strong(ws, node::k_signal))
+  if (ws > 0 || !p->wait_status_.compare_exchange_strong(ws, node::k_signal)) {
+    stats_wakeups_.fetch_add(1, std::memory_order_relaxed);
     n->unpark();                 // 前驱已取消或标记失败：踢醒让它自己走完入队竞争
+  }
   return true;
 }
 

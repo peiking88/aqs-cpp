@@ -20,18 +20,19 @@ docs/          设计对照文档
 cmake -B build -G Ninja
 cmake --build build -j$(nproc)
 cd build && ctest --output-on-failure     # 或直接 ./test_aqs
+./build/bench_aqs                         # 性能基准（手工运行，不注册 ctest）
 ```
 
 依赖：Linux、g++ ≥ 8（C++17）、CMake ≥ 3.14、pthread。
 
 ## 一览
 
-| 类 | 对应 Java | 关键语义 |
-|---|---|---|
-| `aqs::abstract_aqs` | `AbstractQueuedSynchronizer` | 模板方法骨架；子类只实现 4 个钩子 |
-| `aqs::reentrant_lock` | `ReentrantLock` | 公平/非公平、可重入计数、Condition |
-| `aqs::semaphore` | `Semaphore` | 许可上限不变量、公平可选 |
-| `aqs::countdown_latch` | `CountDownLatch` | 计数到 0 唤醒全部等待者 |
+| 类                     | 对应 Java                    | 关键语义                           |
+| ---------------------- | ---------------------------- | ---------------------------------- |
+| `aqs::abstract_aqs`    | `AbstractQueuedSynchronizer` | 模板方法骨架；子类只实现 4 个钩子  |
+| `aqs::reentrant_lock`  | `ReentrantLock`              | 公平/非公平、可重入计数、Condition |
+| `aqs::semaphore`       | `Semaphore`                  | 许可上限不变量、公平可选           |
+| `aqs::countdown_latch` | `CountDownLatch`             | 计数到 0 唤醒全部等待者            |
 
 waitStatus 常量与 Java 一致：`CANCELLED=1 / SIGNAL=-1 / CONDITION=-2 / PROPAGATE=-3`。
 
@@ -94,19 +95,21 @@ try_release_shared(arg)     -> bool   共享：true 触发 doReleaseShared 传�
 
 - 互斥不变量：临界区同时进入数恒为 1（公平/非公平各数万次抢锁）
 - 许可上限不变量：12 线程争 3 许可，进入数永不超 3 且归还守恒
+- 公平共享模式：信号量公平门压测，上限、无饥饿与传播唤醒一并校验
 - 有界队列：6×6 生产消费者合计 6000 元素求和守恒（Condition 全路径）
 - 取消风暴：毫秒级以下超时高频触发 cancelAcquire 摘链，全程互斥不被破坏
 - 公平性烟雾检查：长压测中每个线程获锁次数不低于均值的一半
+- 白盒唤醒证据：`stats_wakeups()` 断言唤醒确实来自队列传播，而非 2ms 轮询兜底
 
 ## 与 OpenJDK 的差异
 
-| 差异 | 原因 | 说明 |
-|---|---|---|
-| 无中断语义 | std::thread 不可中断 | InterruptedException 相关路径省略；超时是唯一取消来源，cancelAcquire 完整保留 |
-| 节点 arena 回收 | Java 靠 GC | 节点延迟到 synchronizer 析构统一释放，规避反向扫描悬垂指针 |
-| Parker 用 futex | 平台原生挂起原语 | 三态 permit（0 空/1 已投递/2 睡眠），保持 LockSupport"先 unpark 后 park 不丢失"语义 |
-| 等待一律 2ms 有界睡 | 见 docs/design.md §5 | 封死 SIGNAL 标记与 release 读状态交错的微窗口，最坏代价是竞争时的周期复查 |
-| 公平门改走 prev 反向计数 | 见 docs/design.md §6 | next 是惰性发布的单写链，极端竞争下存在陈旧窗口；prev 由入队者亲手写定且永久存活 |
+| 差异                     | 原因                 | 说明                                                                                |
+| ------------------------ | -------------------- | ----------------------------------------------------------------------------------- |
+| 无中断语义               | std::thread 不可中断 | InterruptedException 相关路径省略；超时是唯一取消来源，cancelAcquire 完整保留       |
+| 节点 arena 回收          | Java 靠 GC           | 节点延迟到 synchronizer 析构统一释放，规避反向扫描悬垂指针                          |
+| Parker 用 futex          | 平台原生挂起原语     | 三态 permit（0 空/1 已投递/2 睡眠），保持 LockSupport"先 unpark 后 park 不丢失"语义 |
+| 等待一律 2ms 有界睡      | 见 docs/design.md §5 | 封死 SIGNAL 标记与 release 读状态交错的微窗口，最坏代价是竞争时的周期复查           |
+| 公平门改走 prev 反向计数 | 见 docs/design.md §6 | next 是惰性发布的单写链，极端竞争下存在陈旧窗口；prev 由入队者亲手写定且永久存活    |
 
 其余（enq/addWaiter 两次 CAS、acquireQueued 自旋 + 惰性 SIGNAL、unparkSuccessor
 尾向扫描、setHeadAndPropagate/doReleaseShared 传播、ConditionObject 双队列搬运、
@@ -115,6 +118,6 @@ cancelAcquire 含尾指针 CAS 分支）均逐行对照 OpenJDK 源码移植，
 
 ## 版本
 
-0.1.0（`aqs::version`）
+0.1.1（`aqs::version`）
 
 License：MIT

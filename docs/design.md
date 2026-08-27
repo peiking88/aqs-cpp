@@ -5,24 +5,24 @@ cancelAcquire 缺少尾指针 CAS 分支与"前驱是否可靠"判定，本实�
 
 ## 1. 三大核心的映射
 
-| Java | C++ | 备注 |
-|---|---|---|
-| `volatile int state` | `std::atomic<int> state_` | 读 acquire 写 release，CAS 用 seq_cst |
-| `volatile Node head/tail` | `std::atomic<node*>` | enq 两次 CAS：惰性哑元头 + 尾插 |
-| `volatile waitStatus/prev/next` | 对应原子成员 | next_waiter / tid 与 Java 同为非 volatile |
-| `Unsafe.compareAndSwapXxx` | `compare_exchange_strong` | |
-| `LockSupport.park/unpark` | 每节点 Parker（§4） | |
+| Java                            | C++                       | 备注                                      |
+| ------------------------------- | ------------------------- | ----------------------------------------- |
+| `volatile int state`            | `std::atomic<int> state_` | 读 acquire 写 release，CAS 用 seq_cst     |
+| `volatile Node head/tail`       | `std::atomic<node*>`      | enq 两次 CAS：惰性哑元头 + 尾插           |
+| `volatile waitStatus/prev/next` | 对应原子成员              | next_waiter / tid 与 Java 同为非 volatile |
+| `Unsafe.compareAndSwapXxx`      | `compare_exchange_strong` |                                           |
+| `LockSupport.park/unpark`       | 每节点 Parker（§4）       |                                           |
 
 ## 2. 队列协议（独占路径逐行对照）
 
-* **addWaiter/enq**：快速路径 CAS 尾插，失败自旋入队；先写 `prev` 再抢 tail，
+- **addWaiter/enq**：快速路径 CAS 尾插，失败自旋入队；先写 `prev` 再抢 tail，
   抢到后才发布 `pred->next`——顺序保证其他线程看到的链没有半成品。
-* **acquireQueued**：前驱 == head 才尝试钩子；失败先给前驱惰性打 SIGNAL，
+- **acquireQueued**：前驱 == head 才尝试钩子；失败先给前驱惰性打 SIGNAL，
   打完必须再自旋一轮确认，才允许 park。
-* **release**：`tryRelease` 成功且 head 带非零状态 → unparkSuccessor。
-* **unparkSuccessor**：清 SIGNAL 后优先走 next；next 为空或已取消则
+- **release**：`tryRelease` 成功且 head 带非零状态 → unparkSuccessor。
+- **unparkSuccessor**：清 SIGNAL 后优先走 next；next 为空或已取消则
   从 tail 反向扫到最近的有效后继。反向遍历是 AQS 应对取消的核心手段。
-* **setHead**：只清 `prev`，**不清 `next`、不改 waitStatus**。
+- **setHead**：只清 `prev`，**不清 `next`、不改 waitStatus**。
   hasQueuedPredecessors 与唤醒扫描都依赖这条悬而未断的旧链；
   help GC 断链发生在前任节点上（`p.next = null`），不是新 head 上。
 

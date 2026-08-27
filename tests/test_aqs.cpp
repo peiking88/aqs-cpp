@@ -57,6 +57,8 @@ static int hardware_threads_capped() {
 
 // ---------------------------------------------------------------- 独占模式
 
+// 已知豁免：重入计数溢出抛 monitor_error（reentrant_lock::nonfair_try_acquire 中
+// nextc < 0 分支）需约 INT_MAX 次 lock，进程内不可实测。
 static void test_reentrant_basic() {
   reentrant_lock lk;
   CHECK(!lk.is_locked());
@@ -155,6 +157,45 @@ static void test_semaphore_stress() {
   CHECK(sem.available_permits() == 3);         // 归还守恒
 }
 
+// 公平共享模式：try_acquire_shared 内的公平门（has_queued_predecessors）
+// 与独占路径代码不同，需单独压测上限不变量与防饥饿。
+static void test_semaphore_fair() {
+  semaphore sem(2, /*fair=*/true);
+  std::atomic<int> inside{0}, max_seen{0};
+  std::atomic<bool> violated{false};
+
+  const int workers = hardware_threads_capped(), rounds = 1000;
+  std::vector<int> per_thread(static_cast<size_t>(workers), 0);
+  std::vector<std::thread> pool;
+  for (int w = 0; w < workers; ++w) {
+    pool.emplace_back([&, w] {
+      for (int i = 0; i < rounds; ++i) {
+        sem.acquire();
+        const int now = inside.fetch_add(1) + 1;
+        int prev_max = max_seen.load();
+        while (now > prev_max && !max_seen.compare_exchange_weak(prev_max, now)) {}
+        if (now > 2) violated.store(true);     // 许可上限不变量
+        ++per_thread[static_cast<size_t>(w)];
+        inside.fetch_sub(1);
+        sem.release();
+      }
+    });
+  }
+  for (auto& th : pool) th.join();
+
+  CHECK(!violated.load());
+  CHECK(max_seen.load() <= 2);
+  CHECK(sem.available_permits() == 2);         // 归还守恒
+  const long min_take =                        // 公平性烟雾检查：无人被饿死
+      *std::min_element(per_thread.begin(), per_thread.end());
+  const long expect_avg =
+      static_cast<long>(workers) * rounds / workers;
+  CHECK(min_take * 2 >= expect_avg);
+  CHECK(sem.stats_wakeups() > 0);              // 确实经过队列传播唤醒，非纯轮询兜底
+  std::printf("  [公平信号量] 线程=%d 每线程轮次=%d 违规=%d\n", workers, rounds,
+              violated.load());
+}
+
 static void test_semaphore_try_and_timeout() {
   semaphore sem(2);
   CHECK(sem.try_acquire_immediate());
@@ -165,6 +206,7 @@ static void test_semaphore_try_and_timeout() {
   const auto waited =
       sc::duration_cast<sc::milliseconds>(sc::steady_clock::now() - t0).count();
   CHECK(waited >= 70);
+  CHECK(waited < 2000);                        // 宽松上界：防超时实现退化成秒级失控
   sem.release();
   CHECK(sem.acquire_for(50ms));                // 释放后立即可得（0→占用）
   sem.release();                               // 归还 → 1
@@ -195,10 +237,12 @@ static void test_countdown_latch() {
   for (int i = 0; i < 16; ++i) latch.count_down();
   CHECK(done.await_for(10s));
   CHECK(passed.load() == 16);
+  CHECK(latch.stats_wakeups() > 0);            // 计数到 0 走传播唤醒而非轮询自愈
   CHECK(latch.count() == 0);
   latch.count_down();                          // 幂等
   CHECK(latch.count() == 0);
   CHECK(latch.await_for(1ms));                 // 已开的门立即通过
+  CHECK(countdown_latch(0).await_for(1ms));    // 边界：构造即开门，立即放行
   CHECK_THROWS(countdown_latch(-1), std::invalid_argument);
   for (auto& th : pool) th.join();
 }
@@ -208,13 +252,15 @@ static void test_countdown_latch() {
 static void test_bounded_queue_with_condition() {
   constexpr int k_capacity = 8, k_per_producer = 1000, k_producers = 6,
                 k_consumers = 6;
+  constexpr long k_expected =
+      static_cast<long>(k_producers * k_per_producer) *
+      (k_producers * k_per_producer + 1) / 2;     // 1..N 全局唯一值之和
   reentrant_lock lk;
   auto& not_full = lk.new_condition();
   auto& not_empty = lk.new_condition();
 
   std::deque<int> q;
   std::atomic<long> sum_pushed{0}, sum_popped{0};
-  std::atomic<int> produced{0}, consumed{0};
 
   std::vector<std::thread> pool;
   for (int p = 0; p < k_producers; ++p) {
@@ -227,7 +273,6 @@ static void test_bounded_queue_with_condition() {
         not_empty.signal();
         lk.unlock();
         sum_pushed.fetch_add(v);
-        produced.fetch_add(1);
       }
     });
   }
@@ -236,7 +281,10 @@ static void test_bounded_queue_with_condition() {
       for (;;) {
         lk.lock();
         while (q.empty()) {
-          if (consumed.load() >= produced.load()) {
+          // 终止协议：弹出的唯一值总和达标 ⇔ 所有生产者已完工且队列已清空。
+          // （若用 produced/consumed 计数器作判据，生产者滞留待推时二者恰好
+          // 相等，会误退出让其永眠于条件队列——快速路径下的真实缺陷。）
+          if (sum_popped.load() == k_expected) {
             not_empty.signal_all();            // 唤醒同伴消费者一起退出
             lk.unlock();
             return;
@@ -248,15 +296,13 @@ static void test_bounded_queue_with_condition() {
         not_full.signal();
         lk.unlock();
         sum_popped.fetch_add(v);
-        consumed.fetch_add(1);
       }
     });
   }
   for (auto& th : pool) th.join();
 
-  CHECK(produced.load() == k_producers * k_per_producer);
-  CHECK(consumed.load() == produced.load());
-  CHECK(sum_pushed.load() == sum_popped.load());   // 无丢失无重复
+  CHECK(sum_pushed.load() == k_expected);         // 无丢失
+  CHECK(sum_popped.load() == k_expected);         // 无重复：唯一值恰各弹一次
   CHECK(q.empty());
   CHECK(!not_empty.has_waiters());
 }
@@ -267,6 +313,8 @@ static void test_condition_timeout_and_errors() {
 
   CHECK_THROWS(cond.signal(), monitor_error);  // 不持锁通知 → IllegalMonitorState 同款
   CHECK_THROWS(cond.await(), monitor_error);
+  CHECK_THROWS(cond.wait_for(1ms), monitor_error);
+  CHECK_THROWS(cond.signal_all(), monitor_error);
 
   // 场景一：signal_all 确定性唤醒（用轮询代替固定 sleep 消除竞态）
   {
@@ -307,6 +355,7 @@ static void test_condition_timeout_and_errors() {
     });
     waiter.join();
     CHECK(waited_ms.load() >= 70);
+    CHECK(waited_ms.load() < 2000);            // 宽松上界：防超时实现退化成秒级失控
     CHECK(!lk.is_locked());
   }
 }
@@ -375,6 +424,8 @@ class exclusive_only final : public abstract_aqs {  // 只覆写独占钩子的�
 
  public:
   using abstract_aqs::acquire_shared;          // 故意暴露未实现的共享入口以验证默认行为
+  using abstract_aqs::acquire_shared_for;
+  using abstract_aqs::release_shared;
 };
 }  // namespace
 
@@ -382,7 +433,9 @@ static void test_unsupported_hooks() {
   exclusive_only s;
   s.acquire(1);
   s.release(1);
-  CHECK_THROWS(s.acquire_shared(1), monitor_error);  // UnsupportedOperationException 对应物
+  CHECK_THROWS(s.acquire_shared(1), monitor_error);          // UnsupportedOperationException 对应物
+  CHECK_THROWS(s.release_shared(1), monitor_error);
+  CHECK_THROWS(s.acquire_shared_for(1, 1ms), monitor_error); // 兼验超时入口的异常摘链路径
 }
 
 // ---------------------------------------------------------------- 主入口
@@ -397,6 +450,7 @@ int main() {
       {"mutex_stress_nonfair", [] { mutex_stress(false, "非公平"); }},
       {"mutex_stress_fair", [] { mutex_stress(true, "公平"); }},
       {"semaphore_stress", test_semaphore_stress},
+      {"semaphore_fair", test_semaphore_fair},
       {"semaphore_timeout", test_semaphore_try_and_timeout},
       {"countdown_latch", test_countdown_latch},
       {"bounded_queue", test_bounded_queue_with_condition},

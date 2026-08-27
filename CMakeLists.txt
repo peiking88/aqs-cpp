@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(aqs-cpp VERSION 0.1.0 LANGUAGES CXX)
+project(aqs-cpp VERSION 0.1.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -21,3 +21,8 @@ add_executable(test_aqs tests/test_aqs.cpp)
 target_compile_options(test_aqs PRIVATE -Wall -Wextra)
 target_link_libraries(test_aqs PRIVATE aqs)
 add_test(NAME aqs_all COMMAND test_aqs)
+
+# 性能基准：手工运行 ./build/bench_aqs，不注册 ctest
+add_executable(bench_aqs tests/bench_aqs.cpp)
+target_compile_options(bench_aqs PRIVATE -Wall -Wextra)
+target_link_libraries(bench_aqs PRIVATE aqs)
